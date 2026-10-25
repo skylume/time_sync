@@ -112,21 +112,16 @@ class NTPSync:
     def __init__(self, servers=None, timeout=15, max_workers=6):
         # 默认NTP服务器列表
         self.default_servers = [
-            "ntp.ntsc.ac.cn",
-            "ntp.aliyun.com",
-            "pool.ntp.org",
-            "time.windows.com",
-            "ntp.tencent.com",
-            "time.edu.cn",
-            "ntp.tuna.tsinghua.edu.cn",
-            "ntp1.aliyun.com",
-            "ntp2.aliyun.com",
-            "ntp3.aliyun.com",
-            "ntp4.aliyun.com",
-            "time1.cloud.tencent.com",
-            "time2.cloud.tencent.com",
-            "time3.cloud.tencent.com",
-            "time4.cloud.tencent.com"
+            "ntp.ntsc.ac.cn",                # 中科院国家授时中心（国内最权威）
+            "ntp.aliyun.com",                # 阿里云公共NTP（主）
+            "ntp.tencent.com",               # 腾讯云公共NTP（主）
+            "time.windows.com",              # 微软（Win7原生，保底）
+            "pool.ntp.org",                  # 全球NTP池（最终兜底）
+            "cn.pool.ntp.org",               # pool中国子池（国内就近）
+            "ntp.tuna.tsinghua.edu.cn",      # 清华大学（教育网）
+            "time.edu.cn",                   # 中国教育网
+            "time1.tencent.com",             # 腾讯独立入口（备）
+            "ntp.neu6.edu.cn"                # 东北大学（教育网备胎）
         ]
         self.servers = servers or self.default_servers
         self.timeout = timeout
@@ -468,14 +463,15 @@ class TimeSyncApp(QMainWindow):
         self.config_file = "settings.ini"
         self.default_servers = [
             "ntp.ntsc.ac.cn",
-            "pool.ntp.org",
             "ntp.aliyun.com",
-            "time.windows.com", 
             "ntp.tencent.com",
-            "time.edu.cn",
+            "time.windows.com",
+            "pool.ntp.org",
+            "cn.pool.ntp.org",
             "ntp.tuna.tsinghua.edu.cn",
-            "ntp1.aliyun.com",
-            "ntp2.aliyun.com"
+            "time.edu.cn",
+            "time1.tencent.com",
+            "ntp.neu6.edu.cn"
         ]
         self.servers = self.default_servers.copy()
         self.dark_mode = False  # 默认亮色模式
