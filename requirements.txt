@@ -1,2 +1,6 @@
-PyQt5==5.15.4
-ntplib==0.4.0
+# 运行依赖（针对 Win7 锁定版本，勿随意升级）
+PyQt5==5.15.4          # PyQt5 最后支持 Win7 的版本线
+ntplib==0.4.0          # 纯Python，无平台限制
+
+# 打包依赖（开发时用，Win7 只支持 PyInstaller 5.x，勿升级到 6.x）
+# pip install "pyinstaller==5.13.2"

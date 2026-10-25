@@ -16,11 +16,12 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-:: 安装/升级PyInstaller
-echo 正在安装/升级打包工具...
-pip install --upgrade pyinstaller > nul 2>nul
+:: 安装/升级PyInstaller（Win7 只支持 PyInstaller 5.x，勿用最新版6.x）
+:: 先卸载旧版再装兼容版本，避免 --upgrade 拉到不支持 Win7 的新版
+pip uninstall -y pyinstaller >nul 2>nul
+pip install "pyinstaller==5.13.2" > nul 2>nul
 if %errorlevel% neq 0 (
-    echo 错误: 安装PyInstaller失败，请手动执行: pip install pyinstaller
+    echo 错误: 安装PyInstaller失败，请手动执行: pip install pyinstaller==5.13.2
     pause
     exit /b 1
 )
