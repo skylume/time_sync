@@ -13,6 +13,9 @@ from logging.handlers import RotatingFileHandler
 # 忽略sip相关的DeprecationWarning（兼容Win7和旧版本PyQt）
 warnings.filterwarnings('ignore', category=DeprecationWarning)
 
+# 版本号（供窗口标题与打包脚本统一使用）
+__version__ = "2.4"
+
 # 检查是否在打包环境中运行
 is_frozen = getattr(sys, 'frozen', False)
 base_path = sys._MEIPASS if is_frozen else os.path.dirname(os.path.abspath(__file__))
@@ -21,7 +24,7 @@ base_path = sys._MEIPASS if is_frozen else os.path.dirname(os.path.abspath(__fil
 try:
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QPushButton, QTextEdit, QLabel, QStatusBar, QSizePolicy,
-                               QMessageBox, QDialog, QTextBrowser, QFrame)
+                               QMessageBox, QDialog, QTextBrowser, QFrame, QCheckBox, QComboBox)
     from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QMetaObject, Q_ARG, pyqtSlot
     from PyQt5.QtGui import (QIcon, QFont, QColor, QPalette, QTextCharFormat, 
                            QTextCursor, QLinearGradient, QPainter, QBrush, QPen)
@@ -55,6 +58,23 @@ def run_as_admin():
         return True
     except:
         return False
+
+
+# 单实例锁：用命名互斥量防止同时运行两份程序（避免互踩配置文件/同时改系统时间）
+def acquire_single_instance(name="TimeSyncTool" + __version__):
+    """尝试获取互斥量。成功(独占)返回句柄；失败(已有实例在跑)返回 None。"""
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        # 第一个参数为 NULL 时创建匿名互斥量，但命名互斥量跨进程；见下
+        # 这里用 OpenMutex 检查是否已存在，若不存在则 CreateMutex 抢占
+        mutex = kernel32.CreateMutexW(None, False, name)
+        if kernel32.GetLastError() == 183:  # ERROR_ALREADY_EXISTS
+            kernel32.CloseHandle(mutex)
+            return None
+        return mutex
+    except Exception:
+        # 非 Windows 或无权限时退回不限制（不影响主逻辑）
+        return True
 
 # 设置Windows系统时间
 def set_windows_time(offset_seconds):
@@ -441,7 +461,7 @@ class BorderFrame(QFrame):
 class TimeSyncApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("时间同步工具 v2.3")
+        self.setWindowTitle(f"时间同步工具 v{__version__}")
         self.setMinimumSize(950, 750)
         # 修复QWidget::setMaximumSize警告，使用Qt允许的最大尺寸
         self.setMaximumSize(QSize(16777215, 16777215))
@@ -475,6 +495,12 @@ class TimeSyncApp(QMainWindow):
         ]
         self.servers = self.default_servers.copy()
         self.dark_mode = False  # 默认亮色模式
+
+        # 定时自动校时配置
+        self.auto_sync_enabled = True      # 默认开启
+        self.auto_sync_interval = 24       # 默认每 24 小时校时一次（小时）
+        self.auto_sync_timer = QTimer()
+        self.auto_sync_timer.timeout.connect(self.auto_sync)
         
         # 窗口拖动相关变量
         self.is_dragging = False
@@ -489,8 +515,11 @@ class TimeSyncApp(QMainWindow):
         # 创建UI
         self.create_ui()
         
-        # 启动自动同步
+        # 启动自动同步（启动后 1 秒执行首次同步）
         QTimer.singleShot(1000, self.auto_sync)
+        
+        # 启动定时自动校时
+        self.start_auto_sync_timer()
         
         # 启动时间更新定时器
         self.time_timer = QTimer()
@@ -617,6 +646,44 @@ class TimeSyncApp(QMainWindow):
         self.clear_btn.clicked.connect(self.clear_log)
         
         content_layout.addLayout(function_btn_layout)
+        
+        # 定时自动校时设置区
+        timer_frame = QFrame()
+        timer_frame.setObjectName("timerFrame")
+        timer_layout = QHBoxLayout(timer_frame)
+        timer_layout.setContentsMargins(15, 10, 15, 10)
+        timer_layout.setSpacing(10)
+        
+        # 启用开关
+        self.auto_sync_check = QCheckBox("定时自动校时")
+        self.auto_sync_check.setFont(QFont("Microsoft YaHei", 10, QFont.Bold))
+        self.auto_sync_check.setChecked(self.auto_sync_enabled)
+        self.auto_sync_check.toggled.connect(self.on_auto_sync_toggle)
+        timer_layout.addWidget(self.auto_sync_check)
+        
+        # 间隔下拉
+        timer_layout.addWidget(QLabel("间隔:"))
+        self.auto_sync_interval_combo = QComboBox()
+        self.auto_sync_interval_combo.addItem("每 1 小时", 1)
+        self.auto_sync_interval_combo.addItem("每 6 小时", 6)
+        self.auto_sync_interval_combo.addItem("每 12 小时", 12)
+        self.auto_sync_interval_combo.addItem("每 24 小时", 24)
+        self.auto_sync_interval_combo.setFixedWidth(110)
+        idx = self.auto_sync_interval_combo.findData(self.auto_sync_interval)
+        if idx >= 0:
+            self.auto_sync_interval_combo.setCurrentIndex(idx)
+        self.auto_sync_interval_combo.currentIndexChanged.connect(self.on_auto_sync_interval_change)
+        timer_layout.addWidget(self.auto_sync_interval_combo)
+        
+        timer_layout.addStretch()
+        
+        # 下次校时倒计时
+        self.next_sync_label = QLabel("")
+        self.next_sync_label.setFont(QFont("Microsoft YaHei", 9))
+        self.next_sync_label.setStyleSheet("color: #888888;")
+        timer_layout.addWidget(self.next_sync_label)
+        
+        content_layout.addWidget(timer_frame)
         
         # 服务器配置区域（合理高度）
         server_frame = QFrame()
@@ -966,6 +1033,33 @@ class TimeSyncApp(QMainWindow):
                     border: 1px solid #404040;
                     border-radius: 10px;
                 }
+                #timerFrame {
+                    background-color: #2b2b2b;
+                    border: 1px solid #505050;
+                    border-radius: 8px;
+                }
+                #timerFrame QCheckBox {
+                    color: #e0e0e0;
+                    spacing: 6px;
+                }
+                #timerFrame QCheckBox::indicator {
+                    width: 15px; height: 15px;
+                    border: 1px solid #888888; border-radius: 4px;
+                    background-color: #353535;
+                }
+                #timerFrame QCheckBox::indicator:checked {
+                    background-color: #2196F3; border-color: #2196F3;
+                }
+                #timerFrame QComboBox {
+                    background-color: #353535;
+                    color: #e0e0e0;
+                    border: 1px solid #606060; border-radius: 5px;
+                    padding: 4px 8px;
+                }
+                #timerFrame QComboBox QAbstractItemView {
+                    background-color: #353535; color: #e0e0e0;
+                    selection-background-color: #3949AB; border: 1px solid #505050;
+                }
             """
             
             # 文本编辑框样式
@@ -1167,6 +1261,33 @@ class TimeSyncApp(QMainWindow):
                     border: 1px solid #e0e0e0;
                     border-radius: 10px;
                 }
+                #timerFrame {
+                    background-color: #f4f6f8;
+                    border: 1px solid #e0e0e0;
+                    border-radius: 8px;
+                }
+                #timerFrame QCheckBox {
+                    color: #333333;
+                    spacing: 6px;
+                }
+                #timerFrame QCheckBox::indicator {
+                    width: 15px; height: 15px;
+                    border: 1px solid #bbbbbb; border-radius: 4px;
+                    background-color: white;
+                }
+                #timerFrame QCheckBox::indicator:checked {
+                    background-color: #2196F3; border-color: #2196F3;
+                }
+                #timerFrame QComboBox {
+                    background-color: white;
+                    color: #333333;
+                    border: 1px solid #cccccc; border-radius: 5px;
+                    padding: 4px 8px;
+                }
+                #timerFrame QComboBox QAbstractItemView {
+                    background-color: white; color: #333333;
+                    selection-background-color: #BBDEFB; border: 1px solid #cccccc;
+                }
             """
             
             # 文本编辑框样式
@@ -1285,6 +1406,8 @@ class TimeSyncApp(QMainWindow):
                 config.read(self.config_file, encoding='utf-8')
                 if 'Settings' in config:
                     self.dark_mode = config.getboolean('Settings', 'dark_mode', fallback=False)
+                    self.auto_sync_enabled = config.getboolean('Settings', 'auto_sync_enabled', fallback=True)
+                    self.auto_sync_interval = config.getint('Settings', 'auto_sync_interval', fallback=24)
                     if 'servers' in config['Settings']:
                         server_list = [s.strip() for s in config['Settings']['servers'].split('\n') if s.strip()]
                         if server_list:
@@ -1296,6 +1419,9 @@ class TimeSyncApp(QMainWindow):
                     else:
                         self.servers = self.default_servers.copy()
                         self.logger.info("配置文件中没有服务器配置，使用默认服务器")
+                # 兜底校验：防止配置文件里的非法值
+                if self.auto_sync_interval not in (1, 6, 12, 24):
+                    self.auto_sync_interval = 24
             else:
                 self.servers = self.default_servers.copy()
                 self.logger.info("配置文件不存在，使用默认服务器配置")
@@ -1308,6 +1434,8 @@ class TimeSyncApp(QMainWindow):
         config = configparser.ConfigParser()
         config['Settings'] = {
             'dark_mode': str(self.dark_mode),
+            'auto_sync_enabled': str(self.auto_sync_enabled),
+            'auto_sync_interval': str(self.auto_sync_interval),
             'servers': '\n'.join(self.servers)
         }
         tmp_file = self.config_file + '.tmp'
@@ -1352,12 +1480,61 @@ class TimeSyncApp(QMainWindow):
             # 恢复之前的配置
             self.server_edit.setText("\n".join(self.servers))
     
+    def start_auto_sync_timer(self):
+        """根据配置启动/停止定时自动校时 QTimer"""
+        if self.auto_sync_enabled:
+            self.auto_sync_timer.start(self.auto_sync_interval * 3600 * 1000)  # 毫秒
+        else:
+            self.auto_sync_timer.stop()
+        self._update_next_sync_label()
+    
+    def on_auto_sync_toggle(self, checked):
+        """定时校时开关变化"""
+        self.auto_sync_enabled = checked
+        self.start_auto_sync_timer()
+        self.save_config()
+        self.logger.info(f"{'启用' if checked else '停用'}定时自动校时")
+        self.append_log(f"⏱️ {'启用' if checked else '停用'}定时自动校时", logging.INFO)
+    
+    def on_auto_sync_interval_change(self, index):
+        """校时间隔变化"""
+        self.auto_sync_interval = int(self.auto_sync_interval_combo.itemData(index))
+        # 改为新间隔后重新起算周期
+        self.start_auto_sync_timer()
+        self.save_config()
+        self.logger.info(f"定时校时间隔改为 {self.auto_sync_interval} 小时")
+        self.append_log(f"⏱️ 定时校时间隔改为 {self.auto_sync_interval} 小时", logging.INFO)
+    
+    def _update_next_sync_label(self):
+        """实时刷新“下次校时”文字（由秒定时器调用）"""
+        if not hasattr(self, 'next_sync_label'):
+            return
+        if not self.auto_sync_enabled or not self.auto_sync_timer.isActive():
+            self.next_sync_label.setText("自动校时已关闭")
+            return
+        remaining_ms = self.auto_sync_timer.remainingTime()
+        if remaining_ms < 0:
+            self.next_sync_label.setText("即将校时...")
+            return
+        secs = int(remaining_ms // 1000)
+        h, rem = divmod(secs, 3600)
+        m, s = divmod(rem, 60)
+        self.next_sync_label.setText(f"下次校时: {h:02d}:{m:02d}:{s:02d}")
+    
     def auto_sync(self):
         """自动同步时间"""
         self.logger.info("🚀 启动自动时间同步...")
+        self._run_sync("auto")
+    
+    def _run_sync(self, source="auto"):
+        """手动/自动同步统一入口。source: auto=自动, manual=手动。带并发守卫。"""
+        # 并发守卫：已有同步线程在跑则跳过，避免叠加 SetSystemTime
+        if hasattr(self, 'sync_thread') and self.sync_thread.isRunning():
+            self.logger.warning(f"同步正在进行中，忽略本次{'自动' if source=='auto' else '手动'}触发")
+            return
         self.sync_btn.setEnabled(False)
         self.sync_btn.setText("🔄 同步中...")
-        self.status_label.setText("⏳ 正在自动同步时间...")
+        self.status_label.setText("⏳ 正在同步时间...")
         
         self.sync_thread = SyncThread(self.servers)
         self.sync_thread.sync_finished.connect(self.on_sync_finished)
@@ -1367,17 +1544,14 @@ class TimeSyncApp(QMainWindow):
     def manual_sync(self):
         """手动同步时间"""
         self.logger.info("👤 用户手动触发时间同步")
-        self.sync_btn.setEnabled(False)
-        self.sync_btn.setText("🔄 同步中...")
-        self.status_label.setText("⏳ 正在手动同步时间...")
-        
-        self.sync_thread = SyncThread(self.servers)
-        self.sync_thread.sync_finished.connect(self.on_sync_finished)
-        self.sync_thread.sync_progress.connect(self.on_sync_progress)
-        self.sync_thread.start()
+        self._run_sync("manual")
     
     def test_servers(self):
         """测试所有NTP服务器连接"""
+        # 并发守卫：已有测试线程在跑则跳过
+        if hasattr(self, 'test_thread') and self.test_thread.isRunning():
+            self.logger.warning("服务器测试正在进行中，忽略本次触发")
+            return
         self.logger.info("🔧 开始测试所有NTP服务器连接...")
         self.test_btn.setEnabled(False)
         self.status_label.setText("🔍 正在测试服务器连接...")
@@ -1434,6 +1608,9 @@ class TimeSyncApp(QMainWindow):
         """更新当前时间显示（高对比度）"""
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self.current_time_label.setText(f"⏰ 当前时间: {current_time}")
+        # 同步刷新“下次校时”倒计时
+        if hasattr(self, 'next_sync_label'):
+            self._update_next_sync_label()
     
     def closeEvent(self, event):
         """关闭事件处理"""
@@ -1454,6 +1631,17 @@ class TimeSyncApp(QMainWindow):
         if hasattr(self, 'time_timer') and self.time_timer.isActive():
             self.time_timer.stop()
         
+        if hasattr(self, 'auto_sync_timer') and self.auto_sync_timer.isActive():
+            self.auto_sync_timer.stop()
+        
+        # 释放单实例锁
+        mutex = getattr(self, '_mutex', None)
+        if mutex not in (None, True):
+            try:
+                ctypes.WinDLL('kernel32', use_last_error=True).CloseHandle(mutex)
+            except Exception:
+                pass
+        
         event.accept()
 
 # 主程序入口
@@ -1471,12 +1659,20 @@ def main():
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps)
     
+    # 单实例检查（在创建窗口前）
+    _mutex = acquire_single_instance()
+    if _mutex is None:
+        app = QApplication(sys.argv)
+        QMessageBox.information(None, "提示", "时间同步工具已在运行中。")
+        sys.exit(0)
+    
     app = QApplication(sys.argv)
     
     # 设置应用样式（兼容Win7的Fusion风格）
     app.setStyle("Fusion")
     
     window = TimeSyncApp()
+    window._mutex = _mutex
     window.show()
     
     sys.exit(app.exec_())
