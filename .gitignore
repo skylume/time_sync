@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 打包产物 (PyInstaller / Nuitka)
+dist/
+build/
+*.spec
+
+# 运行时生成
+settings.ini
+timesync.log

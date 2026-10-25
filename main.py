@@ -1,12 +1,12 @@
 import sys
 import os
 import time
-import threading
 import socket
 import ctypes
 import configparser
+import concurrent.futures
 import warnings
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import logging
 from logging.handlers import RotatingFileHandler
 
@@ -21,7 +21,7 @@ base_path = sys._MEIPASS if is_frozen else os.path.dirname(os.path.abspath(__fil
 try:
     from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
                                QPushButton, QTextEdit, QLabel, QStatusBar, QSizePolicy,
-                               QMessageBox, QDialog, QTextBrowser, QFrame, QScrollArea)
+                               QMessageBox, QDialog, QTextBrowser, QFrame)
     from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QMetaObject, Q_ARG, pyqtSlot
     from PyQt5.QtGui import (QIcon, QFont, QColor, QPalette, QTextCharFormat, 
                            QTextCursor, QLinearGradient, QPainter, QBrush, QPen)
@@ -47,7 +47,9 @@ def is_admin():
 def run_as_admin():
     executable = sys.executable
     script = os.path.abspath(sys.argv[0])
-    params = ' '.join([script] + sys.argv[1:])
+    # 对含空格的路径加引号，避免参数被拆散
+    script_q = f'"{script}"'
+    params = ' '.join([script_q] + [f'"{a}"' if ' ' in a else a for a in sys.argv[1:]])
     try:
         ctypes.windll.shell32.ShellExecuteW(None, "runas", executable, params, None, 1)
         return True
@@ -55,11 +57,19 @@ def run_as_admin():
         return False
 
 # 设置Windows系统时间
-def set_windows_time(utc_time):
-    """设置Windows系统时间"""
+def set_windows_time(offset_seconds):
+    """设置Windows系统时间。
+
+    接收 NTP 校正后的时钟偏移（秒），用系统当前时间 + 偏移换算，避免直接采信
+    某个延迟大的服务器 tx_time 导致的偏差。用 SetSystemTime（UTC）而非
+    SetLocalTime，由 Windows 自己换算本地显示，不依赖本机时区配置。
+    """
     try:
-        # 转换为本地时间
-        local_time = utc_time.astimezone()
+        # 目标 UTC 时间 = 当前本机时间 + 时钟偏移
+        utc_time = time.time() + offset_seconds
+        # utc_dt 用于填 SetSystemTime 结构（需 UTC 分量）；local_dt 仅用于展示
+        utc_dt = datetime.fromtimestamp(utc_time, timezone.utc)
+        local_dt = utc_dt.astimezone()
         
         # 创建SYSTEMTIME结构
         class SYSTEMTIME(ctypes.Structure):
@@ -75,21 +85,21 @@ def set_windows_time(utc_time):
             ]
         
         st = SYSTEMTIME()
-        st.wYear = local_time.year
-        st.wMonth = local_time.month
-        st.wDay = local_time.day
-        st.wDayOfWeek = local_time.weekday()  # 0=Monday, 6=Sunday
-        st.wHour = local_time.hour
-        st.wMinute = local_time.minute
-        st.wSecond = local_time.second
-        st.wMilliseconds = local_time.microsecond // 1000
+        st.wYear = utc_dt.year
+        st.wMonth = utc_dt.month
+        st.wDay = utc_dt.day
+        st.wDayOfWeek = utc_dt.weekday()  # Windows协定0=Sunday..6=Saturday，但SetSystemTime会忽略该字段
+        st.wHour = utc_dt.hour
+        st.wMinute = utc_dt.minute
+        st.wSecond = utc_dt.second
+        st.wMilliseconds = utc_dt.microsecond // 1000
         
-        # 调用Windows API
+        # SetSystemTime 设UTC（不依赖本机时区配置）；原SetLocalTime设本地时间
         kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        success = kernel32.SetLocalTime(ctypes.byref(st))
+        success = kernel32.SetSystemTime(ctypes.byref(st))
         
         if success:
-            return True, f"系统时间已更新: {local_time.strftime('%Y-%m-%d %H:%M:%S')}"
+            return True, f"系统时间已更新: {local_dt.strftime('%Y-%m-%d %H:%M:%S')}"
         else:
             error_code = ctypes.get_last_error()
             return False, f"设置系统时间失败，错误代码: {error_code}"
@@ -99,13 +109,13 @@ def set_windows_time(utc_time):
 
 # NTP时间同步器
 class NTPSync:
-    def __init__(self, servers=None, timeout=15):
+    def __init__(self, servers=None, timeout=15, max_workers=6):
         # 默认NTP服务器列表
         self.default_servers = [
             "ntp.ntsc.ac.cn",
             "ntp.aliyun.com",
             "pool.ntp.org",
-            "time.windows.com", 
+            "time.windows.com",
             "ntp.tencent.com",
             "time.edu.cn",
             "ntp.tuna.tsinghua.edu.cn",
@@ -120,46 +130,74 @@ class NTPSync:
         ]
         self.servers = servers or self.default_servers
         self.timeout = timeout
+        self.max_workers = max_workers
         self.logger = logging.getLogger("NTPSync")
-    
+
     def get_time_from_server(self, server):
-        """从单个NTP服务器获取时间，返回延迟"""
+        """从单个NTP服务器获取时间。
+        成功返回 (True, offset, delay_s, None, ms)；offset 为往返修正后的时钟偏移（秒）。
+        """
         start_time = time.time()
         try:
             client = ntplib.NTPClient()
             response = client.request(server, version=3, timeout=self.timeout)
-            elapsed_time = (time.time() - start_time) * 1000  # 转换为毫秒
-            return True, response, None, elapsed_time
+            ms = (time.time() - start_time) * 1000  # 实际往返毫秒
+            return True, response.offset, response.delay, None, ms
         except socket.timeout:
-            elapsed_time = (time.time() - start_time) * 1000
-            return False, None, f"连接超时 ({self.timeout}秒)", elapsed_time
+            return False, None, None, f"连接超时 ({self.timeout}秒)", (time.time() - start_time) * 1000
         except socket.gaierror:
-            elapsed_time = (time.time() - start_time) * 1000
-            return False, None, "DNS解析失败", elapsed_time
+            return False, None, None, "DNS解析失败", (time.time() - start_time) * 1000
         except Exception as e:
-            elapsed_time = (time.time() - start_time) * 1000
-            return False, None, str(e), elapsed_time
-    
+            return False, None, None, str(e), (time.time() - start_time) * 1000
+
     def sync_time(self):
-        """尝试从多个服务器同步时间"""
+        """并发探测多个服务器，对返回的 offset 取中位数，过滤异常节点。
+
+        返回 (success, offset_seconds, server, delay_ms, good_count, results)。
+        - success: 是否有至少一个服务器成功
+        - offset_seconds: 中位数时钟偏移（秒）
+        - server: 中位数对应节点
+        - delay_ms: 中位数对应节点延迟
+        - good_count: 成功节点数
+        """
         results = []
-        
-        for server in self.servers:
-            success, response, error, delay = self.get_time_from_server(server)
-            results.append({
-                'server': server,
-                'success': success,
-                'response': response,
-                'error': error,
-                'delay': delay
-            })
-            
-            if success:
-                # 转换为UTC时间
-                utc_time = datetime.fromtimestamp(response.tx_time, timezone.utc)
-                return True, utc_time, server, delay, results
-        
-        return False, None, None, None, results
+        good = []  # (offset, delay_ms, server)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as ex:
+            future_map = {ex.submit(self.get_time_from_server, srv): srv for srv in self.servers}
+            for future in concurrent.futures.as_completed(future_map):
+                server = future_map[future]
+                try:
+                    ok, offset, delay, error, ms = future.result()
+                except Exception as e:
+                    ok, offset, delay, error, ms = False, None, None, str(e), 0.0
+                results.append({
+                    'server': server,
+                    'success': ok,
+                    'offset': offset,
+                    'error': error,
+                    'delay': ms,
+                    'delay_s': delay
+                })
+                if ok:
+                    good.append((offset, ms, server))
+
+        if not good:
+            return False, 0.0, None, None, 0, results
+
+        # 取 offset 中位数：抗单个异常/污染节点把系统时间改坏
+        good_sorted = sorted(good, key=lambda x: x[0])
+        n = len(good_sorted)
+        if n % 2 == 1:
+            med_index = n // 2
+            med_offset = float(good_sorted[med_index][0])
+        else:
+            med_index = n // 2 - 1
+            med_offset = (float(good_sorted[n // 2 - 1][0]) + float(good_sorted[n // 2][0])) / 2.0
+        med_offset = float(med_offset)
+        med_server = good_sorted[med_index][2]
+        med_delay_ms = good_sorted[med_index][1]
+        return True, med_offset, med_server, med_delay_ms, n, results
 
 # 日志处理器
 class LogHandler(logging.Handler):
@@ -180,30 +218,42 @@ class SyncThread(QThread):
     def __init__(self, servers):
         super().__init__()
         self.servers = servers
+        self._stop = False
     
     def run(self):
         try:
             self.sync_progress.emit("开始时间同步...")
             ntp_sync = NTPSync(self.servers, timeout=15)
             
-            success, utc_time, server, delay, results = ntp_sync.sync_time()
+            success, offset_sec, server, delay, good_count, results = ntp_sync.sync_time()
             
-            if success:
-                # 设置系统时间
-                set_success, set_message = set_windows_time(utc_time)
-                if set_success:
-                    local_time = utc_time.astimezone()
-                    message = f"时间同步成功!\n服务器: {server}\n延迟: {delay:.2f}ms\n本地时间: {local_time.strftime('%Y-%m-%d %H:%M:%S')}"
-                    self.sync_finished.emit(True, message, server, delay)
-                else:
-                    self.sync_finished.emit(False, f"同步失败: {set_message}", "", 0.0)
-            else:
+            if not success:
                 error_messages = []
                 for result in results:
                     if not result['success']:
                         error_messages.append(f"{result['server']}: {result['error']} (延迟: {result['delay']:.2f}ms)")
                 error_msg = "所有服务器同步失败:\n" + "\n".join(error_messages)
                 self.sync_finished.emit(False, error_msg, "", 0.0)
+                return
+            
+            # 偏差门限：若中位数偏移 < 500ms，说明时间基本准，跳过需要管理员的写操作
+            threshold = 0.5  # 秒
+            if abs(offset_sec) < threshold:
+                local_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                msg = (f"时间已准确，无需调整（偏差 {offset_sec*1000:.1f}ms < {threshold*1000:.0f}ms）\n"
+                       f"服务器: {server} (延迟: {delay:.2f}ms)\n本地时间: {local_str}")
+                self.sync_finished.emit(True, msg, server, delay)
+                return
+            
+            # 设置系统时间
+            set_success, set_message = set_windows_time(offset_sec)
+            if set_success:
+                local_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                message = (f"时间同步成功!\n服务器: {server} (延迟: {delay:.2f}ms)\n"
+                           f"偏移: {offset_sec:+.3f}秒\n本地时间: {local_str}")
+                self.sync_finished.emit(True, message, server, delay)
+            else:
+                self.sync_finished.emit(False, f"同步失败: {set_message}", "", 0.0)
         
         except Exception as e:
             self.sync_finished.emit(False, f"同步过程中发生错误: {str(e)}", "", 0.0)
@@ -216,6 +266,7 @@ class TestServersThread(QThread):
     def __init__(self, servers):
         super().__init__()
         self.servers = servers
+        self._stop = False
     
     def run(self):
         try:
@@ -224,8 +275,11 @@ class TestServersThread(QThread):
             results = []
             
             for i, server in enumerate(self.servers):
+                if self._stop:
+                    self.test_progress.emit("测试已中断")
+                    return
                 self.test_progress.emit(f"测试服务器 ({i+1}/{len(self.servers)}): {server}")
-                success, _, error, delay = ntp_sync.get_time_from_server(server)
+                success, offset, _delay_s, error, delay = ntp_sync.get_time_from_server(server)
                 
                 if success:
                     status = f"✅ 成功 (延迟: {delay:.2f}ms)"
@@ -683,11 +737,14 @@ class TimeSyncApp(QMainWindow):
         self.logger = logging.getLogger("TimeSyncApp")
         self.logger.setLevel(logging.INFO)
         
-        # 文件日志
-        file_handler = RotatingFileHandler("timesync.log", maxBytes=1024*1024, backupCount=5, encoding='utf-8')
-        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(file_formatter)
-        self.logger.addHandler(file_handler)
+        # 文件日志（若目录不可写，降级为仅UI日志，避免启动崩溃）
+        try:
+            file_handler = RotatingFileHandler("timesync.log", maxBytes=1024*1024, backupCount=5, encoding='utf-8')
+            file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            file_handler.setFormatter(file_formatter)
+            self.logger.addHandler(file_handler)
+        except Exception as e:
+            self.logger.warning(f"无法创建日志文件（降级为仅界面日志）: {e}")
         
         # UI日志
         ui_handler = LogHandler(self)
@@ -1251,21 +1308,40 @@ class TimeSyncApp(QMainWindow):
             self.servers = self.default_servers.copy()
     
     def save_config(self):
-        """保存配置"""
+        """保存配置（原子写：先写临时文件再替换，避免写一半损坏配置）"""
         config = configparser.ConfigParser()
         config['Settings'] = {
             'dark_mode': str(self.dark_mode),
             'servers': '\n'.join(self.servers)
         }
+        tmp_file = self.config_file + '.tmp'
         try:
-            with open(self.config_file, 'w', encoding='utf-8') as f:
+            with open(tmp_file, 'w', encoding='utf-8') as f:
                 config.write(f)
+            os.replace(tmp_file, self.config_file)  # 原子替换
             self.logger.info(f"配置已保存，包含 {len(self.servers)} 个服务器")
         except Exception as e:
+            # 清理可能的临时文件
+            try:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except OSError:
+                pass
             self.logger.error(f"保存配置失败: {e}")
     
     def save_servers(self):
-        """保存服务器配置"""
+        """保存服务器配置（防抖：停止输入 1.5 秒后才真正写入）"""
+        # 取消之前的定时器
+        if hasattr(self, 'save_timer') and self.save_timer.isActive():
+            self.save_timer.stop()
+        else:
+            self.save_timer = QTimer()
+            self.save_timer.setSingleShot(True)
+            self.save_timer.timeout.connect(self._do_save_servers)
+        self.save_timer.start(1500)  # 1500ms 防抖
+    
+    def _do_save_servers(self):
+        """防抖后真正执行保存"""
         text = self.server_edit.toPlainText().strip()
         new_servers = [line.strip() for line in text.split('\n') if line.strip()]
         
@@ -1367,14 +1443,16 @@ class TimeSyncApp(QMainWindow):
         """关闭事件处理"""
         self.logger.info("📤 CloseOperation: 程序正在关闭，清理资源...")
         
-        # 停止所有线程
+        # 设置中断标志，让阻塞线程尽快退出（socket 循环轮询 _stop）
         if hasattr(self, 'sync_thread') and self.sync_thread.isRunning():
+            self.sync_thread._stop = True
             self.sync_thread.quit()
-            self.sync_thread.wait(2000)
+            self.sync_thread.wait(3000)
         
         if hasattr(self, 'test_thread') and self.test_thread.isRunning():
+            self.test_thread._stop = True
             self.test_thread.quit()
-            self.test_thread.wait(2000)
+            self.test_thread.wait(3000)
         
         # 停止定时器
         if hasattr(self, 'time_timer') and self.time_timer.isActive():
