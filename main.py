@@ -570,7 +570,7 @@ class TimeSyncApp(QMainWindow):
         # 标题区域
         title_icon = QLabel("⏱️")
         title_icon.setFont(QFont("Arial", 14))
-        title_label = QLabel("时间同步工具 v2.3")
+        title_label = QLabel(f"时间同步工具 v{__version__}")
         title_label.setFont(QFont("Microsoft YaHei", 12, QFont.Bold))
         
         title_layout.addWidget(title_icon)
